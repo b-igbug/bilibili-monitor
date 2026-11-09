@@ -19,6 +19,7 @@ import json
 import hashlib
 import os
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 
@@ -39,6 +40,27 @@ STATE_FILE = os.environ.get("STATE_FILE", "state.json")
 # B站接口地址
 DYNAMIC_API = "https://api.bilibili.com/x/polymer/web-dynamic/v1/feed/space"
 NAV_API = "https://api.bilibili.com/x/web-interface/nav"
+SPI_API = "https://api.bilibili.com/x/frontend/finger/spi"
+
+# 必须带上 features=itemOpusStyle 等参数，B站才会以 OPUS 格式返回完整文字内容
+# （否则文字/图文动态返回的是被置空的旧 DRAW 格式）
+BILI_FEATURES = "itemOpusStyle,listOnlyfans,opusBigCover,onlyfansVote,forwardListHidden,decorationCard,commentsNewVersion,onlyfansAssetsV2,ugcDelete,onlyfansQaCard,avatarAutoTheme,sunflowerStyle,cardsEnhance,eva3CardOpus,eva3CardVideo,eva3CardComment,eva3CardUser"
+DM_IMG_PARAMS = {
+    "web_location": "333.1387",
+    "dm_img_list": "[]",
+    "dm_img_str": "V2ViR0wgMS4wIChPcGVuR0wgRVMgMi4wIENocm9taXVtKQ",
+    "dm_cover_img_str": "QU5HTEUgKEludGVsLCBJbnRlbChSKSBBcmMoVE0pIEdyYXBoaWNzICgweDAwMDA3RDU1KSBEaXJlY3QzRDExIHZzXzVfMCBwc181XzAsIEQzRDExKUdvb2dsZSBJbmMuIChJbnRlbC",
+    "dm_img_inter": '{"ds":[],"wh":[4581,4952,17],"of":[236,472,236]}',
+    "x-bili-locale-json": '{"c_locale":{"language":"zh","script":"Hans"},"always_translate":false}',
+    "x-bili-device-req-json": '{"platform":"web","device":"pc","spmid":"333.1387","mobi_app":"web_cn"}',
+}
+
+DEBUG = os.environ.get("DEBUG", "1") == "1"
+
+
+def log(msg):
+    if DEBUG:
+        print("[debug]", msg)
 
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -55,18 +77,62 @@ MIXIN_KEY_ENC_TAB = [
 ]
 
 
+def http_get_json(url, cookie=None, referer="https://www.bilibili.com/", timeout=20):
+    """带可选 cookie 的 GET，返回 (解析后的dict, 错误信息)"""
+    headers = {
+        "User-Agent": USER_AGENT,
+        "Referer": referer,
+        "Accept": "application/json, text/plain, */*",
+        "Accept-Language": "zh-CN,zh;q=0.9",
+    }
+    if cookie:
+        headers["Cookie"] = cookie
+    req = urllib.request.Request(url, headers=headers)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            raw = resp.read().decode("utf-8", "replace")
+        return json.loads(raw), None
+    except urllib.error.HTTPError as e:
+        return None, f"HTTP {e.code}"
+    except Exception as e:
+        return None, f"{type(e).__name__}: {e}"
+
+
+def get_buvid_cookie():
+    """从 finger/spi 接口获取 buvid3/buvid4（无需登录），用于降低 B站 风控"""
+    data, err = http_get_json(SPI_API, referer="https://www.bilibili.com/")
+    if err:
+        log(f"spi 接口失败: {err}")
+        return None
+    if not data or data.get("code") != 0:
+        log(f"spi 接口返回异常: code={data.get('code') if data else 'None'}")
+        return None
+    b3 = (data.get("data") or {}).get("b_3") or ""
+    b4 = (data.get("data") or {}).get("b_4") or ""
+    if not b3:
+        log("spi 未返回 b_3")
+        return None
+    log(f"buvid3 已获取: {b3[:8]}...")
+    return f"buvid3={b3}; buvid4={b4}"
+
+
 # ---------- WBI 签名 ----------
 def get_mixin_key(orig):
     """用置换表从 img_key+sub_key 生成 mixin_key（取前32位）"""
     return "".join(orig[i] for i in MIXIN_KEY_ENC_TAB)[:32]
 
 
-def get_wbi_keys():
-    """从 nav 接口获取 img_key / sub_key"""
-    req = urllib.request.Request(NAV_API, headers={"User-Agent": USER_AGENT, "Referer": "https://www.bilibili.com/"})
-    with urllib.request.urlopen(req, timeout=20) as resp:
-        data = json.loads(resp.read().decode("utf-8"))
-    wbi = data["data"]["wbi_img"]
+def get_wbi_keys(cookie=None):
+    """从 nav 接口获取 img_key / sub_key
+    注意：nav 未登录时返回 code=-101，但 wbi_img 仍会正常返回，所以只检查 wbi_img。"""
+    data, err = http_get_json(NAV_API, cookie=cookie)
+    if err:
+        log(f"nav 接口失败: {err}")
+        return None
+    wbi = ((data or {}).get("data") or {}).get("wbi_img")
+    if not wbi or not wbi.get("img_url"):
+        log(f"nav 未返回 wbi_img (code={data.get('code') if data else 'None'})")
+        return None
     img_key = wbi["img_url"].rsplit("/", 1)[1].split(".")[0]
     sub_key = wbi["sub_url"].rsplit("/", 1)[1].split(".")[0]
     return img_key, sub_key
@@ -88,87 +154,119 @@ def enc_wbi(params, img_key, sub_key):
 
 
 # ---------- 抓取动态 ----------
-def fetch_newest_dynamic(uid):
+def fetch_dynamics(uid, attempt=0):
     """
-    返回 (动态ID, 动态时间戳, 动态文本, 动态链接)；
+    返回按 id 升序的动态列表 [{id, ts, text, link}]；
     抓取失败/被风控返回 None（调用方不推送、不改状态）。
+    内置多轮重试（每轮重新获取 cookie/密钥）。
     """
-    try:
-        img_key, sub_key = get_wbi_keys()
-    except Exception:
+    cookie = get_buvid_cookie()
+    keys = get_wbi_keys(cookie=cookie)
+    if not keys:
+        if attempt < 2:
+            time.sleep(3)
+            return fetch_dynamics(uid, attempt + 1)
         return None
+    img_key, sub_key = keys
 
-    params = enc_wbi({"host_mid": uid, "platform": "web"}, img_key, sub_key)
+    # 关键：features=itemOpusStyle 等参数，否则文字动态拿不到内容
+    req_params = {"host_mid": uid, "timezone_offset": "-480", "platform": "web", "features": BILI_FEATURES}
+    req_params.update(DM_IMG_PARAMS)
+    params = enc_wbi(req_params, img_key, sub_key)
     url = DYNAMIC_API + "?" + urllib.parse.urlencode(params)
-    req = urllib.request.Request(
-        url,
-        headers={
-            "User-Agent": USER_AGENT,
-            "Referer": f"https://space.bilibili.com/{uid}",
-        },
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=20) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
-    except Exception:
+    data, err = http_get_json(url, cookie=cookie, referer=f"https://space.bilibili.com/{uid}")
+    if err:
+        log(f"动态接口请求失败(uid={uid}): {err}")
+    elif data.get("code") != 0:
+        log(f"动态接口返回(uid={uid}): code={data.get('code')} msg={data.get('message')}")
+
+    if err or not data or data.get("code") != 0:
+        # 重试（风控常为偶发，稍等后换新 cookie 再试）
+        if attempt < 2:
+            time.sleep(5)
+            return fetch_dynamics(uid, attempt + 1)
         return None
 
-    if data.get("code") != 0 or not data.get("data") or not data["data"].get("items"):
+    items = ((data.get("data") or {}).get("items")) or []
+    if not items:
+        log(f"动态列表为空(uid={uid})，第{attempt+1}次尝试")
+        # B站风控常以"空列表"表现，同样需要重试
+        if attempt < 4:
+            time.sleep(4)
+            return fetch_dynamics(uid, attempt + 1)
         return None
 
-    items = data["data"]["items"]
-    # 取 id_str 最大的一条（动态ID随时间递增，天然排除置顶的旧动态）
-    newest = None
+    # 解析所有动态（id_str 随时间递增，天然排除置顶旧动态）
+    dynamics = []
     for it in items:
         id_str = str(it.get("id_str") or "")
         if not id_str.isdigit():
             continue
-        if newest is None or int(id_str) > int(newest["id_str"]):
-            newest = it
-    if newest is None:
-        return None
-
-    id_str = str(newest["id_str"])
-    ts = None
-    try:
-        md = newest.get("modules", {}).get("module_dynamic", {}) or {}
-        ts = md.get("timestamp") or newest.get("desc", {}).get("timestamp")
-    except Exception:
         ts = None
-    text = extract_dynamic_text(newest)
-    link = f"https://t.bilibili.com/{id_str}"
-    return id_str, ts, text, link
+        try:
+            ma = it.get("modules", {}).get("module_author", {}) or {}
+            ts = int(ma.get("pub_ts") or 0) or None
+        except Exception:
+            ts = None
+        dynamics.append({
+            "id": id_str,
+            "ts": ts,
+            "text": extract_dynamic_text(it),
+            "link": f"https://t.bilibili.com/{id_str}",
+        })
+    if not dynamics:
+        return None
+    dynamics.sort(key=lambda x: int(x["id"]))
+    return dynamics
 
 
 def extract_dynamic_text(item):
-    """尽量从动态中提取可读文本"""
+    """从动态中提取可读文本。
+    优先级：转发评论(desc) > OPUS图文正文 > 视频标题 > 专栏标题 > 转发内容(orig)
+    """
     try:
         md = item.get("modules", {}).get("module_dynamic", {}) or {}
     except Exception:
         md = {}
+    major = md.get("major") or {}
+    mtype = major.get("type") or ""
     text = ""
     try:
-        text = (md.get("desc") or {}).get("text") or ""
+        if mtype == "MAJOR_TYPE_OPUS":
+            # 新版图文动态（含纯文字），正文在 opus.summary.text
+            opus = major.get("opus") or {}
+            text = (opus.get("summary") or {}).get("text") or ""
+            if not text:
+                text = (opus.get("title") or "")
+        elif mtype in ("MAJOR_TYPE_VIDEO", "MAJOR_TYPE_ARCHIVE"):
+            text = (major.get("archive") or {}).get("title") or ""
+        elif mtype == "MAJOR_TYPE_ARTICLE":
+            text = (major.get("article") or {}).get("title") or ""
     except Exception:
         text = ""
+    # 转发动态：desc 是转发评论
+    try:
+        desc = (md.get("desc") or {}).get("text") or ""
+    except Exception:
+        desc = ""
+    if desc:
+        text = (text + "\n" + desc).strip() if text else desc
     if not text:
-        major = md.get("major") or {}
-        mtype = major.get("type")
+        # 转发动态的原内容
+        orig = item.get("orig") or {}
         try:
-            if mtype in ("MAJOR_TYPE_VIDEO", "MAJOR_TYPE_ARCHIVE"):
-                text = (major.get("archive") or {}).get("title") or ""
-            elif mtype == "MAJOR_TYPE_DRAW":
-                text = (major.get("draw") or {}).get("title") or ""
-            elif mtype == "MAJOR_TYPE_ARTICLE":
-                text = (major.get("article") or {}).get("title") or ""
-            elif mtype == "MAJOR_TYPE_OPUS":
-                text = ((major.get("opus") or {}).get("summary") or {}).get("text") or ""
+            omd = orig.get("modules", {}).get("module_dynamic", {}) or {}
+            om = omd.get("major") or {}
+            if om.get("type") in ("MAJOR_TYPE_ARCHIVE", "MAJOR_TYPE_VIDEO"):
+                text = "转发视频：" + ((om.get("archive") or {}).get("title") or "")
+            elif om.get("type") == "MAJOR_TYPE_OPUS":
+                text = "转发动态：" + (((om.get("opus") or {}).get("summary") or {}).get("text") or "")
         except Exception:
-            text = text or ""
+            pass
     text = (text or "").strip()
-    if len(text) > 200:
-        text = text[:200] + "…"
-    return text or "（该动态无文字内容）"
+    if len(text) > 300:
+        text = text[:300] + "…"
+    return text if text else "（无文字内容）"
 
 
 # ---------- 飞书推送 ----------
@@ -213,42 +311,63 @@ def main():
     for up in UP_LIST:
         uid = up["uid"]
         name = up["name"]
-        got = fetch_newest_dynamic(uid)
-        if got is None or got[0] is None:
+        dynamics = fetch_dynamics(uid)
+        if not dynamics:
             print(f"[{now_str}] {name}({uid}) 抓取失败或暂无动态，跳过")
             continue
 
-        id_str, ts, text, link = got
+        newest_id = dynamics[-1]["id"]
         last_id = state.get(uid)
 
-        if last_id is None:
-            state[uid] = id_str
-            print(f"[{now_str}] {name}({uid}) 首次建立基线: {id_str}")
+        # 首次建立基线（无记录或空值），不推送，避免历史动态刷屏
+        if not last_id:
+            state[uid] = newest_id
+            print(f"[{now_str}] {name}({uid}) 首次建立基线: {newest_id}")
             changed = True
             continue
 
-        if id_str == last_id:
+        # 找出所有比基线新的动态（升序）
+        news = [d for d in dynamics if int(d["id"]) > int(last_id)]
+        if not news:
             print(f"[{now_str}] {name}({uid}) 无新动态")
             continue
 
-        time_str = ""
-        if ts:
-            try:
-                time_str = time.strftime("%Y-%m-%d %H:%M", time.localtime(int(ts)))
-            except Exception:
+        # 所有新动态合并为一条消息推送
+        msg_parts = []
+        if len(news) == 1:
+            d = news[0]
+            time_str = ""
+            if d["ts"]:
+                try:
+                    time_str = time.strftime("%Y-%m-%d %H:%M", time.localtime(int(d["ts"])))
+                except Exception:
+                    time_str = ""
+            msg_parts = [
+                f"【{name}】发布了新动态",
+                f"时间：{time_str or '刚刚'}",
+                f"内容：{d['text']}",
+                f"链接：{d['link']}",
+            ]
+        else:
+            lines = [f"【{name}】发布了 {len(news)} 条新动态：", ""]
+            for d in news:
                 time_str = ""
-        msg_lines = [
-            f"【{name}】发布了新动态",
-            f"时间：{time_str or '刚刚'}",
-            f"内容：{text}",
-            f"链接：{link}",
-        ]
-        notification = "\n".join(msg_lines)
+                if d["ts"]:
+                    try:
+                        time_str = time.strftime("%H:%M", time.localtime(int(d["ts"])))
+                    except Exception:
+                        time_str = ""
+                lines.append(f"◆ [{time_str or '刚刚'}] {d['text']}")
+                lines.append(f"  {d['link']}")
+                lines.append("")
+            msg_parts = lines
+        notification = "\n".join(msg_parts).strip()
+
         try:
             ret = push_feishu(notification)
             if ret.get("code") == 0:
-                print(f"[{now_str}] {name}({uid}) 已推送新动态 {id_str}")
-                notifications.append(f"{name}: {text}")
+                print(f"[{now_str}] {name}({uid}) 已推送 {len(news)} 条新动态（至 {newest_id}）")
+                notifications.append(f"{name}: {news[-1]['text'][:40]}")
             else:
                 print(f"[{now_str}] {name}({uid}) 推送失败: {ret}")
                 continue
@@ -256,7 +375,7 @@ def main():
             print(f"[{now_str}] {name}({uid}) 推送异常: {e}")
             continue
 
-        state[uid] = id_str
+        state[uid] = newest_id
         changed = True
 
     if changed:
