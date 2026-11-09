@@ -249,18 +249,20 @@ def fetch_dynamics(uid, attempt=0):
         if data and data.get("code") == 0 and ((data.get("data") or {}).get("items")):
             log(f"V{vi+1} 成功(uid={uid})")
             break
-        time.sleep(2)
+        time.sleep(1)
     if not data or data.get("code") != 0:
-        # 全档失败，整体重试（换新 cookie/密钥）
-        if attempt < 2:
-            time.sleep(8)
+        # 全档失败，整体重试一次（换新 cookie/密钥）
+        if attempt < 1:
+            time.sleep(5)
             return fetch_dynamics(uid, attempt + 1)
+        if not BILI_SESSDATA:
+            print(f"[提示] B站对海外IP限制严格（412），建议配置 BILI_SESSDATA 登录态（GitHub Secrets）提升通过率")
         return None
     items = ((data.get("data") or {}).get("items")) or []
     if not items:
         log(f"动态列表为空(uid={uid})，第{attempt+1}次尝试")
         # B站风控常以"空列表"表现，同样需要重试
-        if attempt < 4:
+        if attempt < 2:
             time.sleep(4)
             return fetch_dynamics(uid, attempt + 1)
         return None
