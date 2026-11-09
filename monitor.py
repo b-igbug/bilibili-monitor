@@ -170,23 +170,41 @@ def fetch_dynamics(uid, attempt=0):
     img_key, sub_key = keys
 
     # 关键：features=itemOpusStyle 等参数，否则文字动态拿不到内容
-    req_params = {"host_mid": uid, "timezone_offset": "-480", "platform": "web", "features": BILI_FEATURES}
-    req_params.update(DM_IMG_PARAMS)
-    params = enc_wbi(req_params, img_key, sub_key)
-    url = DYNAMIC_API + "?" + urllib.parse.urlencode(params)
-    data, err = http_get_json(url, cookie=cookie, referer=f"https://space.bilibili.com/{uid}")
-    if err:
-        log(f"动态接口请求失败(uid={uid}): {err}")
-    elif data.get("code") != 0:
-        log(f"动态接口返回(uid={uid}): code={data.get('code')} msg={data.get('message')}")
-
-    if err or not data or data.get("code") != 0:
-        # 重试（风控常为偶发，稍等后换新 cookie 再试）
+    # 海外机房 IP（如 GitHub Actions）常被B站拦截(412)，因此采用多档策略：
+    #   V1 完整浏览器参数（可拿全文）→ V2 精简+features → V3 最简（能拿动态ID/视频标题/转发文字）
+    variants = [
+        True,   # V1: 完整浏览器参数
+        False,  # V2: 仅 features
+        None,   # V3: 最简参数
+    ]
+    data = None
+    for vi, full in enumerate(variants):
+        req_params = {"host_mid": uid, "timezone_offset": "-480", "platform": "web", "features": BILI_FEATURES}
+        if full is True:
+            req_params.update(DM_IMG_PARAMS)
+        elif full is None:
+            # V3: 最简参数（老格式，文字动态内容会被隐藏，但动态ID/视频标题/转发可见）
+            req_params = {"host_mid": uid, "platform": "web"}
+        params = enc_wbi(req_params, img_key, sub_key)
+        url = DYNAMIC_API + "?" + urllib.parse.urlencode(params)
+        referer = f"https://space.bilibili.com/{uid}/dynamic" if full is True else f"https://space.bilibili.com/{uid}"
+        data, err = http_get_json(url, cookie=cookie, referer=referer)
+        if err:
+            log(f"V{vi+1} 请求失败(uid={uid}): {err}")
+            data = None
+        elif data.get("code") != 0:
+            log(f"V{vi+1} 返回(uid={uid}): code={data.get('code')} {data.get('message')}")
+            data = None
+        if data and data.get("code") == 0 and ((data.get("data") or {}).get("items")):
+            log(f"V{vi+1} 成功(uid={uid})")
+            break
+        time.sleep(2)
+    if not data or data.get("code") != 0:
+        # 全档失败，整体重试（换新 cookie/密钥）
         if attempt < 2:
-            time.sleep(5)
+            time.sleep(8)
             return fetch_dynamics(uid, attempt + 1)
         return None
-
     items = ((data.get("data") or {}).get("items")) or []
     if not items:
         log(f"动态列表为空(uid={uid})，第{attempt+1}次尝试")
@@ -266,7 +284,7 @@ def extract_dynamic_text(item):
     text = (text or "").strip()
     if len(text) > 300:
         text = text[:300] + "…"
-    return text if text else "（无文字内容）"
+    return text if text else "（内容暂未取到，点击链接查看）"
 
 
 # ---------- 飞书推送 ----------
