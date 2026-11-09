@@ -23,6 +23,13 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
+# ---------- curl_cffi：模拟 Chrome TLS 指纹（绕过 B站 对机房 IP/脚本指纹的 412 风控） ----------
+try:
+    from curl_cffi import requests as cffi_requests
+    HAS_CFFI = True
+except ImportError:
+    HAS_CFFI = False
+
 # ============ 配置区 ============
 # 飞书群机器人 webhook 地址
 # 优先读环境变量 FEISHU_WEBHOOK；为空时回退到下面内置的地址
@@ -57,6 +64,9 @@ DM_IMG_PARAMS = {
 
 DEBUG = os.environ.get("DEBUG", "1") == "1"
 
+# 可选：B站登录态 cookie（SESSDATA），能显著提升风控通过率（需配合 GitHub Secrets）
+BILI_SESSDATA = os.environ.get("BILI_SESSDATA", "").strip()
+
 
 def log(msg):
     if DEBUG:
@@ -68,6 +78,10 @@ USER_AGENT = (
 )
 # ==============================
 
+# curl_cffi 的 Chrome 模拟目标（新→旧逐个尝试）
+_IM_PERSONATES = ["chrome131", "chrome124", "chrome120", "chrome116", "chrome110", "chrome"]
+_WORKING_IMPERSONATE = None
+
 # B站 WBI 签名置换表（固定值）
 MIXIN_KEY_ENC_TAB = [
     46, 47, 18, 2, 53, 8, 23, 32, 15, 50, 10, 31, 58, 3, 45, 35, 27, 43, 5, 49,
@@ -77,8 +91,42 @@ MIXIN_KEY_ENC_TAB = [
 ]
 
 
+def _cffi_get_json(url, cookie=None, referer="https://www.bilibili.com/", timeout=20):
+    """用 curl_cffi（Chrome TLS 指纹）请求，返回 (dict, err)"""
+    global _WORKING_IMPERSONATE
+    headers = {
+        "User-Agent": USER_AGENT,
+        "Referer": referer,
+        "Accept": "application/json, text/plain, */*",
+        "Accept-Language": "zh-CN,zh;q=0.9",
+    }
+    if cookie:
+        headers["Cookie"] = cookie
+    imps = [_WORKING_IMPERSONATE] if _WORKING_IMPERSONATE else _IM_PERSONATES
+    last_err = None
+    for imp in imps:
+        if not imp:
+            continue
+        try:
+            r = cffi_requests.get(url, headers=headers, impersonate=imp, timeout=timeout)
+            if r.status_code != 200:
+                last_err = f"HTTP {r.status_code}"
+                continue
+            _WORKING_IMPERSONATE = imp
+            return r.json(), None
+        except Exception as e:
+            last_err = f"cffi({imp}): {type(e).__name__}: {e}"
+    return None, last_err or "cffi all-failed"
+
+
 def http_get_json(url, cookie=None, referer="https://www.bilibili.com/", timeout=20):
-    """带可选 cookie 的 GET，返回 (解析后的dict, 错误信息)"""
+    """带可选 cookie 的 GET，返回 (解析后的dict, 错误信息)
+    优先 curl_cffi（Chrome 指纹），不可用时回退 urllib。"""
+    if HAS_CFFI:
+        data, err = _cffi_get_json(url, cookie=cookie, referer=referer, timeout=timeout)
+        if data is not None:
+            return data, None
+        log(f"cffi 请求失败降级 urllib: {err}")
     headers = {
         "User-Agent": USER_AGENT,
         "Referer": referer,
@@ -100,20 +148,23 @@ def http_get_json(url, cookie=None, referer="https://www.bilibili.com/", timeout
 
 def get_buvid_cookie():
     """从 finger/spi 接口获取 buvid3/buvid4（无需登录），用于降低 B站 风控"""
+    parts = []
     data, err = http_get_json(SPI_API, referer="https://www.bilibili.com/")
     if err:
         log(f"spi 接口失败: {err}")
-        return None
-    if not data or data.get("code") != 0:
+    elif not data or data.get("code") != 0:
         log(f"spi 接口返回异常: code={data.get('code') if data else 'None'}")
-        return None
-    b3 = (data.get("data") or {}).get("b_3") or ""
-    b4 = (data.get("data") or {}).get("b_4") or ""
-    if not b3:
-        log("spi 未返回 b_3")
-        return None
-    log(f"buvid3 已获取: {b3[:8]}...")
-    return f"buvid3={b3}; buvid4={b4}"
+    else:
+        b3 = (data.get("data") or {}).get("b_3") or ""
+        b4 = (data.get("data") or {}).get("b_4") or ""
+        if b3:
+            log(f"buvid3 已获取: {b3[:8]}...")
+            parts.append(f"buvid3={b3}; buvid4={b4}")
+    # 可选登录态：SESSDATA（存在时大幅提升过风控率）
+    if BILI_SESSDATA:
+        parts.append(f"SESSDATA={BILI_SESSDATA}")
+        log("已附加登录态 SESSDATA")
+    return "; ".join(parts) if parts else None
 
 
 # ---------- WBI 签名 ----------
